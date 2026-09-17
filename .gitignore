@@ -1,0 +1,17 @@
+.env
+node_modules/
+logs/
+.scannerwork/
+nginx/certs/
+backend/uploads/
+coverage/
+certs/
+k8s/01-secret.yml
+k8s/rendered/
+
+# Playwright E2E
+e2e/.env
+e2e/test-results/
+e2e/playwright-report/
+e2e/blob-report/
+e2e/.cache/

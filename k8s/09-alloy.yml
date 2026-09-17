@@ -1,0 +1,108 @@
+# The original alloy/config.alloy uses discovery.docker against
+# /var/run/docker.sock, which does not exist on RKE2 (containerd, not
+# Docker). This is rewritten to discovery.kubernetes, which talks to the
+# API server instead of a container socket, hence the RBAC below. This was
+# flagged as the single biggest gotcha in migrating this stack: without this
+# rewrite, Alloy starts, looks healthy, and silently collects nothing.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy
+  namespace: orca
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy-logs
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy-logs
+subjects:
+  - kind: ServiceAccount
+    name: alloy
+    namespace: orca
+roleRef:
+  kind: ClusterRole
+  name: alloy-logs
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: orca
+data:
+  config.alloy: |
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    loki.source.kubernetes "pods" {
+      targets    = discovery.kubernetes.pods.targets
+      forward_to = [loki.relabel.containers.receiver]
+    }
+
+    loki.relabel "containers" {
+      forward_to = [loki.write.local.receiver]
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+
+      rule {
+        target_label = "job"
+        replacement  = "system"
+      }
+    }
+
+    loki.write "local" {
+      endpoint {
+        url = "http://loki:3100/loki/api/v1/push"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: alloy
+  namespace: orca
+spec:
+  selector:
+    matchLabels:
+      app: alloy
+  template:
+    metadata:
+      labels:
+        app: alloy
+    spec:
+      serviceAccountName: alloy
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.17.0
+          args:
+            - "run"
+            - "/etc/alloy/config.alloy"
+          volumeMounts:
+            - name: alloy-config
+              mountPath: /etc/alloy
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              memory: 128Mi
+      volumes:
+        - name: alloy-config
+          configMap:
+            name: alloy-config

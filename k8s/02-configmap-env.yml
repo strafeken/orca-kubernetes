@@ -1,0 +1,27 @@
+# Non-secret config, split out from orca-secrets. These are the values from
+# .env.example that carry no confidentiality requirement, plus DB_HOST/DB_PORT
+# which now point at the in-cluster MySQL Service instead of the compose
+# service name "db".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orca-config
+  namespace: orca
+data:
+  DB_HOST: "mysql"
+  DB_PORT: "3306"
+  LOKI_URL: "http://loki:3100"
+  # Set this to your real hostname once you have one: https://orca.local for
+  # local, https://orca.freeddns.org for cloud. It
+  # feeds CORS/cookie/CSP logic in the backend, so it must match whatever the
+  # browser actually loads the site from.
+  APP_URL: "https://ORCA_HOSTNAME"
+  NODE_ENV: "production"
+  # These three match the code's own fallback defaults in
+  # backend/middleware/upload.js (15MB / 20MB / 300s), spelled out explicitly
+  # here rather than left unset, so the limit is visible in one place instead
+  # of buried in application code. Change the values, not whether the keys
+  # exist, if you want different limits.
+  UPLOAD_MAX_FILE_BYTES: "15728640"
+  UPLOAD_MAX_VOICE_BYTES: "20971520"
+  UPLOAD_MAX_VOICE_SECONDS: "300"

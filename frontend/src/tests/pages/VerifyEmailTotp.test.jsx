@@ -1,0 +1,146 @@
+import { describe, test, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
+
+const mockApiFetch = vi.fn();
+vi.mock('../../auth/api', () => ({
+  apiFetch: (...args) => mockApiFetch(...args),
+}));
+
+import VerifyEmail from '../../pages/VerifyEmail';
+import TotpSetup from '../../pages/TotpSetup';
+
+/**
+ * Tests for the verification & 2FA pages.
+ *   VerifyEmail  — FR-02 / SR-19: a Worker account is activated only after the
+ *                  email-verification token is confirmed by the backend.
+ *   TotpSetup    — SR-21: TOTP soft-token second factor for account recovery.
+ */
+describe('VerifyEmail (FR-02 / SR-19)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function renderWithToken(token) {
+    const path = token ? `/verify-email?token=${token}` : '/verify-email';
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <VerifyEmail />
+      </MemoryRouter>
+    );
+  }
+
+  test('shows an error state when no token is present in the URL', () => {
+    renderWithToken(null);
+    expect(screen.getByText(/verification failed/i)).toBeInTheDocument();
+    // With no token it must not call the backend.
+    expect(mockApiFetch).not.toHaveBeenCalled();
+  });
+
+  test('calls the verify endpoint with the token from the URL', async () => {
+    mockApiFetch.mockResolvedValue({ ok: true, json: async () => ({ message: 'ok' }) });
+    renderWithToken('abc123');
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/api/auth/verify-email?token=abc123')
+      );
+    });
+  });
+
+  test('shows success when the backend confirms the token', async () => {
+    mockApiFetch.mockResolvedValue({ ok: true, json: async () => ({ message: 'ok' }) });
+    renderWithToken('validtoken');
+    await waitFor(() => {
+      expect(screen.getByText(/email verified/i)).toBeInTheDocument();
+    });
+  });
+
+  test('shows failure when the backend rejects the token', async () => {
+    mockApiFetch.mockResolvedValue({ ok: false, json: async () => ({ error: 'Invalid token' }) });
+    renderWithToken('badtoken');
+    await waitFor(() => {
+      expect(screen.getByText(/verification failed/i)).toBeInTheDocument();
+    });
+  });
+
+  test('shows a generic error when the verify request throws', async () => {
+    mockApiFetch.mockRejectedValue(new Error('network'));
+    renderWithToken('tok123');
+    await waitFor(() => {
+      expect(screen.getByText(/something went wrong/i)).toBeInTheDocument();
+    });
+  });
+});
+
+describe('TotpSetup (SR-21)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function renderTotp() {
+    return render(
+      <MemoryRouter>
+        <TotpSetup />
+      </MemoryRouter>
+    );
+  }
+
+  test('renders the 2FA heading and an enable action', () => {
+    renderTotp();
+    expect(screen.getByText(/two-factor authentication/i)).toBeInTheDocument();
+  });
+
+  test('requests a TOTP secret/QR from the backend when setup starts', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ qr: 'data:image/png;base64,xxx', otpauth: 'otpauth://x' }),
+    });
+    renderTotp();
+    const startBtn = screen.getByRole('button');
+    startBtn.click();
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith('/api/auth/totp/setup', { method: 'POST' });
+    });
+  });
+
+  test('shows the QR code and submits the enable request', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ qr: 'data:image/png;base64,xxx' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ message: 'enabled' }),
+      });
+
+    renderTotp();
+    fireEvent.click(screen.getByRole('button', { name: /set up 2fa/i }));
+
+    await waitFor(() => {
+      expect(screen.getByAltText(/totp qr code/i)).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByPlaceholderText('123456'), { target: { value: '654321' } });
+    fireEvent.click(screen.getByRole('button', { name: /enable 2fa/i }));
+
+    await waitFor(() => {
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        '/api/auth/totp/enable',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ totp: '654321' }),
+        })
+      );
+      expect(screen.getByText(/now enabled/i)).toBeInTheDocument();
+    });
+  });
+
+  test('shows an error when setup fails', async () => {
+    mockApiFetch.mockResolvedValue({
+      ok: false,
+      json: async () => ({ error: 'Setup unavailable.' }),
+    });
+    renderTotp();
+    fireEvent.click(screen.getByRole('button', { name: /set up 2fa/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/setup unavailable/i);
+    });
+  });
+});

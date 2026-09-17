@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backend-uploads
+  namespace: orca
+spec:
+  # ReadWriteOnce: fine for a single-node cluster and a single backend
+  # replica, which is what this manifest runs. It's the reason the backend
+  # Deployment below is pinned to replicas: 1 and strategy: Recreate, RWO
+  # volumes can't be mounted by pods on more than one node at a time. Scaling
+  # the backend beyond one replica would need this converted to an RWX
+  # volume (e.g. NFS, EFS on AWS) or the uploads moved to S3 entirely.
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: orca
+  annotations:
+    # Traefik-specific sticky session config. This goes on the Service, not
+    # the Ingress, that's a Traefik quirk worth knowing if you're used to
+    # ingress-nginx's affinity annotation living on the Ingress object.
+    # Needed because Socket.io keeps connection state per-server; without
+    # this, reconnects can land on a different backend pod (moot right now
+    # with replicas: 1, but keep it since bumping replicas later without it
+    # would silently break real-time messaging).
+    traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.name: "orca_lb"
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: orca
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # required because backend-uploads is RWO, see PVC comment above
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: strafeken/orca-backend:ORCA_IMAGE_TAG
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: orca-config
+            - secretRef:
+                name: orca-secrets
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/uploads
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              memory: 512Mi
+          # /api/health is mounted before CSRF middleware in app.js, so it's
+          # safe to hit unauthenticated from a probe.
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: backend-uploads

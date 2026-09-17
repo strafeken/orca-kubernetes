@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: orca
+spec:
+  clusterIP: None   # headless: StatefulSet pods get stable DNS, e.g. mysql-0.mysql
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: orca
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.4.9
+          # Original compose sizing was --innodb-buffer-pool-size=2G on a box
+          # with several other services sharing memory. On a dedicated node
+          # this is fine as-is; if you're running the smaller staging
+          # instance, drop this to 512M to match its lower memory ceiling
+          # (see resources.limits.memory below, they should move together).
+          args:
+            - "--innodb-buffer-pool-size=2G"
+            - "--innodb-log-buffer-size=64M"
+          envFrom:
+            - secretRef:
+                name: orca-secrets
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+            - name: mysql-init
+              mountPath: /docker-entrypoint-initdb.d
+          resources:
+            limits:
+              memory: 4Gi
+            requests:
+              memory: 2Gi
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$(MYSQL_ROOT_PASSWORD)"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$(MYSQL_ROOT_PASSWORD)"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        - name: mysql-init
+          configMap:
+            name: mysql-init
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

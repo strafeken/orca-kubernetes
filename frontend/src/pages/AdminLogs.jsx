@@ -1,0 +1,950 @@
+import { useEffect, useState, useMemo, useCallback } from "react";
+import { apiFetch } from "../auth/api";
+
+/**
+ * Severity ordering used to float the most important entries to the top of the
+ * table: error first, then warn, then everything else (info / unknown). Written
+ * as a switch (not a lookup object keyed by the untrusted `level` string) to
+ * avoid the object-injection lint rule, same approach as LevelBadge below.
+ */
+function severityRank(level) {
+  switch ((level || "info").toLowerCase()) {
+    case "error": return 0;
+    case "warn":  return 1;
+    default:      return 2;
+  }
+}
+
+function logTableColSpan(tab) {
+  if (tab === "all") return 9;
+  if (tab === "audit") return 8;
+  return 6;
+}
+
+function logRowBackground(expanded, idx) {
+  if (expanded) return "rgba(255,179,35,0.05)";
+  if (idx % 2 === 0) return "transparent";
+  return "rgba(255,255,255,0.015)";
+}
+
+function applyLogFilters(logs, { categoryFilter, actionFilter, search }) {
+  let result = [...logs];
+
+  if (categoryFilter !== "all") {
+    result = result.filter((l) => (l.category || "Other") === categoryFilter);
+  }
+  if (actionFilter !== "all") {
+    result = result.filter((l) => l.actionType === actionFilter);
+  }
+  if (search.trim()) {
+    const q = search.trim().toLowerCase();
+    result = result.filter((l) =>
+      (l.msg        || "").toLowerCase().includes(q) ||
+      (l.actionType || "").toLowerCase().includes(q) ||
+      (l.category   || "").toLowerCase().includes(q) ||
+      (l.userId     != null && String(l.userId).includes(q)) ||
+      (l.resourceId != null && String(l.resourceId).includes(q)) ||
+      (l.ip         || "").toLowerCase().includes(q)
+    );
+  }
+
+  result.sort((a, b) => severityRank(a.level) - severityRank(b.level));
+  return result;
+}
+
+function logTableEmptyMessage(loading, logs, filtered) {
+  if (loading && logs.length === 0) return "Loading logs…";
+  if (filtered.length === 0 && logs.length > 0) return "No entries match the current filters.";
+  return "No log entries found for this time range.";
+}
+
+const PAGE_SIZE = 25;
+
+/**
+ * AdminLogs — mounted at /adm/logs.
+ *
+ * Displays the full append-only audit and system event trail pulled from
+ * Loki via GET /api/admin/logs. Satisfies:
+ *
+ *   SR-29 — Audit records include userId, actionType, timestamp, IP and resource.
+ *   SR-30 — Logs are read from the append-only Loki store; no modification is
+ *            possible from this UI (the backend has no delete-log endpoint).
+ *   FR-12 — Every admin read / delete of a chat log is surfaced here.
+ *
+ * Features:
+ *   • Tab switcher: "Audit" (job=audit) | "System" (job=system) | "All"
+ *   • Live search (text filter applied client-side after fetch)
+ *   • Time-range selector: 15 m / 1 h / 6 h / 24 h / 7 d
+ *   • Category column + filter: every audit actionType is bucketed into
+ *     Create / Read / Update / Delete / Login (see backend/utils/
+ *     auditCategories.js) instead of only ever showing Winston's severity
+ *     level (info/warn/error), which said nothing about the kind of
+ *     operation performed.
+ *   • Dedicated Action Type column + filter, populated from the result set
+ *   • Resource column (resourceType + resourceId) on audit/all tabs — the
+ *     dedicated Message column was removed since action names and messages
+ *     were near-duplicates and overlapped visually at smaller widths; the
+ *     raw message is still searchable and visible in the expanded payload.
+ *   • Level badge: colour-coded info / warn / error
+ *   • Expandable row showing the full JSON payload
+ *   • Refresh button (manual) + last-fetched timestamp
+ *   • Empty / error / loading states
+ *
+ * The component is intentionally read-only — admins cannot delete log
+ * entries from this UI, keeping the store append-only per SR-30.
+ */
+export default function AdminLogs() {
+  // ── Fetch state ────────────────────────────────────────────────────
+  const [logs, setLogs]         = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState(null);
+  const [lastFetched, setLastFetched] = useState(null);
+
+  // ── Filter controls ────────────────────────────────────────────────
+  const [tab, setTab]           = useState("audit");   // "audit" | "system" | "all"
+  const [range, setRange]       = useState("1h");
+  const [search, setSearch]     = useState("");
+  const [actionFilter, setActionFilter] = useState("all");
+  const [categoryFilter, setCategoryFilter] = useState("all"); // Create/Read/Update/Delete/Login/Other
+
+  // ── Pagination ─────────────────────────────────────────────────────
+  const [page, setPage] = useState(1);
+
+  // ── Expanded rows ──────────────────────────────────────────────────
+  const [expanded, setExpanded] = useState(new Set());
+
+  // ── Fetch ──────────────────────────────────────────────────────────
+  // `loading` starts true, and tab/range changes are only ever triggered by
+  // handleTabChange/handleRangeChange below (event handlers) — those set
+  // setLoading(true) synchronously there, which is fine since event handlers
+  // aren't covered by react-hooks/set-state-in-effect. This effect itself
+  // only performs the async fetch and resolves with setState calls inside
+  // .then()/.catch()/.finally(), none of which run synchronously when the
+  // effect body executes.
+  const fetchLogs = useCallback(() => {
+    const job = tab === "all" ? "" : tab;
+    const params = new URLSearchParams({ job, range });
+
+    return apiFetch(`/api/admin/logs?${params}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`Server returned ${r.status}`);
+        return r.json();
+      })
+      .then((d) => {
+        setLogs(d.logs || []);
+        setLastFetched(new Date());
+        setExpanded(new Set()); // collapse all on refresh
+        setError(null);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [tab, range]);
+
+  // Fetch whenever tab or range changes.
+  useEffect(() => {
+    fetchLogs();
+  }, [fetchLogs]);
+
+  // NOTE: actionFilter is intentionally reset inside handleTabChange /
+  // handleRangeChange below (event handlers), not in a useEffect keyed on
+  // [tab, range]. Resetting derived UI state from an effect is flagged by
+  // ESLint (react-hooks/set-state-in-effect) because it's indistinguishable
+  // from "syncing with an external system" — here it's really just part of
+  // the same user action that changed tab/range, so it belongs in the
+  // handler that already knows that's happening.
+  function handleTabChange(nextTab) {
+    setTab(nextTab);
+    setActionFilter("all");
+    setCategoryFilter("all");
+    setPage(1);
+    setLoading(true);
+  }
+
+  function handleRangeChange(nextRange) {
+    setRange(nextRange);
+    setActionFilter("all");
+    setCategoryFilter("all");
+    setPage(1);
+    setLoading(true);
+  }
+
+  // Used by the Refresh button (event handler — not subject to the rule).
+  function refreshLogs() {
+    setPage(1);
+    setLoading(true);
+    fetchLogs();
+  }
+
+  // ── Derived data ───────────────────────────────────────────────────
+
+  // Fixed display order for the category filter — always the same 5
+  // CRUD+Login buckets (+ "Other" for anything uncategorized), unlike
+  // actionTypes below which is dynamically derived from whatever's in the
+  // current result set.
+  const CATEGORY_ORDER = ["all", "Create", "Read", "Update", "Delete", "Login", "Other"];
+
+  // Unique action types present in the current result set (audit tab only).
+  const actionTypes = useMemo(() => {
+    const types = new Set();
+    logs.forEach((l) => { if (l.actionType) types.add(l.actionType); });
+    return ["all", ...Array.from(types).sort((a, b) => a.localeCompare(b))];
+  }, [logs]);
+
+  // Apply client-side text search + category + action filter.
+  const filtered = useMemo(
+    () => applyLogFilters(logs, { categoryFilter, actionFilter, search }),
+    [logs, search, actionFilter, categoryFilter]
+  );
+
+  // ── Current page slice ─────────────────────────────────────────────
+  // safePage clamps a possibly-stale page during render (e.g. filters shrank
+  // the result set) without needing a setState-in-effect. Page is reset to 1
+  // by the filter/tab/range/refresh handlers whenever the dataset changes.
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const safePage   = Math.min(page, totalPages);
+  const pageStart  = (safePage - 1) * PAGE_SIZE;
+  const pageRows   = filtered.slice(pageStart, pageStart + PAGE_SIZE);
+
+  // ── Toggle row expansion ───────────────────────────────────────────
+  function toggleRow(idx) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(idx) ? next.delete(idx) : next.add(idx);
+      return next;
+    });
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────
+  function fmtTs(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, {
+      month: "short", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false,
+    });
+  }
+
+  // ── Render ─────────────────────────────────────────────────────────
+  return (
+    <div style={s.page}>
+      {/* ── Page header ───────────────────────────────────────── */}
+      <div style={s.header}>
+        <div>
+          <h1 style={s.title}>Audit &amp; System Logs</h1>
+          <p style={s.subtitle}>
+            Security and event trail via Loki
+          </p>
+        </div>
+        <div style={s.headerRight}>
+          {lastFetched && (
+            <span style={s.lastFetched}>
+              Last fetched {lastFetched.toLocaleTimeString(undefined, { hour12: false })}
+            </span>
+          )}
+          <button style={s.refreshBtn} onClick={refreshLogs} disabled={loading}>
+            {loading ? "Loading…" : "⟳ Refresh"}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Tab bar ───────────────────────────────────────────── */}
+      <div style={s.tabBar}>
+        {[
+          { key: "audit",  label: "📋 Audit Events"  },
+          { key: "system", label: "⚙️ System Logs"    },
+          { key: "all",    label: "🔍 All"             },
+        ].map(({ key, label }) => (
+          <button
+            key={key}
+            style={{
+              ...s.tab,
+              ...(tab === key ? s.tabActive : {}),
+            }}
+            onClick={() => handleTabChange(key)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Filter bar ────────────────────────────────────────── */}
+      <div style={s.filterBar}>
+        {/* Text search */}
+        <input
+          type="search"
+          placeholder="Search message, action, user ID, IP…"
+          value={search}
+          onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+          style={s.searchInput}
+          aria-label="Search logs"
+        />
+
+        {/* Category filter (Create/Read/Update/Delete/Login) — audit only */}
+        {tab !== "system" && (
+          <select
+            value={categoryFilter}
+            onChange={(e) => { setCategoryFilter(e.target.value); setPage(1); }}
+            style={s.select}
+            aria-label="Filter by category"
+          >
+            {CATEGORY_ORDER.map((c) => (
+              <option key={c} value={c}>
+                {c === "all" ? "All categories" : c}
+              </option>
+            ))}
+          </select>
+        )}
+
+        {/* Action type filter (audit only) */}
+        {tab !== "system" && (
+          <select
+            value={actionFilter}
+            onChange={(e) => { setActionFilter(e.target.value); setPage(1); }}
+            style={s.select}
+            aria-label="Filter by action type"
+          >
+            {actionTypes.map((a) => (
+              <option key={a} value={a}>
+                {a === "all" ? "All action types" : a}
+              </option>
+            ))}
+          </select>
+        )}
+
+        {/* Time range */}
+        <select
+          value={range}
+          onChange={(e) => handleRangeChange(e.target.value)}
+          style={s.select}
+          aria-label="Time range"
+        >
+          <option value="15m">Last 15 min</option>
+          <option value="1h">Last 1 hour</option>
+          <option value="6h">Last 6 hours</option>
+          <option value="24h">Last 24 hours</option>
+          <option value="7d">Last 7 days</option>
+        </select>
+
+        {/* Result count */}
+        <span style={s.resultCount}>
+          {loading ? "…" : `${filtered.length} of ${logs.length} entries`}
+        </span>
+      </div>
+
+      {/* ── Error banner ──────────────────────────────────────── */}
+      {error && (
+        <div style={s.errorBanner} role="alert">
+          <strong>Failed to load logs</strong> — {error}
+          <button style={s.retryLink} onClick={refreshLogs}>Retry</button>
+        </div>
+      )}
+
+      {/* ── Log table ─────────────────────────────────────────── */}
+      <div style={s.tableWrapper}>
+        {(loading && logs.length === 0) || filtered.length === 0 ? (
+          <div style={s.emptyState}>{logTableEmptyMessage(loading, logs, filtered)}</div>
+        ) : (
+          <table style={s.table} aria-label="Log entries">
+            <thead>
+              <tr>
+                <th style={{ ...s.th, width: 155 }}>Timestamp</th>
+                <th style={{ ...s.th, width: 58  }}>Level</th>
+                {tab !== "audit" && (
+                  <th style={{ ...s.th, width: 70 }}>Job</th>
+                )}
+                {tab !== "system" && (
+                  <>
+                    <th style={{ ...s.th, width: 90  }}>Category</th>
+                    {/* Audit tab shows the Action Type; the All tab shows the raw
+                        Message instead, so system-log lines (which have no action
+                        type) still show their text alongside audit entries. */}
+                    {tab === "audit" ? (
+                      <th style={{ ...s.th, width: 170 }}>Action Type</th>
+                    ) : (
+                      <th style={s.th}>Message</th>
+                    )}
+                    <th style={{ ...s.th, width: 72  }}>User ID</th>
+                    <th style={{ ...s.th, width: 130 }}>Resource</th>
+                    <th style={{ ...s.th, width: 110 }}>IP</th>
+                  </>
+                )}
+                {tab === "system" && (
+                  <>
+                    <th style={{ ...s.th, width: 72 }}>User ID</th>
+                    <th style={s.th}>Message</th>
+                  </>
+                )}
+                <th style={{ ...s.th, width: 40, textAlign: "center" }}>
+                  ↕
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {pageRows.map((log, i) => {
+                // Absolute index into `filtered` so expand/collapse tracking is
+                // stable across pages, not just within the current slice.
+                const idx = pageStart + i;
+                return (
+                  <LogRow
+                    key={idx}
+                    log={log}
+                    idx={idx}
+                    tab={tab}
+                    expanded={expanded.has(idx)}
+                    onToggle={toggleRow}
+                    fmtTs={fmtTs}
+                  />
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* ── Pagination controls ───────────────────────────────── */}
+      {!loading && filtered.length > 0 && (
+        <div style={s.pagination}>
+          <button
+            style={{ ...s.pageBtn, ...(safePage <= 1 ? s.pageBtnDisabled : {}) }}
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            disabled={safePage <= 1}
+          >
+            ← Prev
+          </button>
+          <span style={s.pageInfo}>
+            Page {safePage} of {totalPages}
+            {" · "}
+            {pageStart + 1}–{Math.min(pageStart + PAGE_SIZE, filtered.length)} of {filtered.length}
+          </span>
+          <button
+            style={{ ...s.pageBtn, ...(safePage >= totalPages ? s.pageBtnDisabled : {}) }}
+            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            disabled={safePage >= totalPages}
+          >
+            Next →
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Log row component ──────────────────────────────────────────────── */
+
+/**
+ * A single table row.  Clicking the expand button in the last column shows
+ * the full JSON payload for that log entry, useful when debugging or
+ * investigating an incident.
+ */
+function LogRow({ log, idx, tab, expanded, onToggle, fmtTs }) {
+  const colSpan = logTableColSpan(tab);
+
+  return (
+    <>
+      <tr style={{ ...s.tr, background: logRowBackground(expanded, idx) }}>
+        {/* Timestamp */}
+        <td style={{ ...s.td, fontVariantNumeric: "tabular-nums", fontSize: 11.5 }}>
+          {fmtTs(log.ts)}
+        </td>
+
+        {/* Level badge */}
+        <td style={s.td}>
+          <LevelBadge level={log.level} />
+        </td>
+
+        {/* Job column (all / system tabs) */}
+        {tab !== "audit" && (
+          <td style={{ ...s.td, fontSize: 11 }}>
+            <span style={{
+              ...s.jobPill,
+              background: log.job === "audit" ? "#2e1d5e" : "#1a2e3b",
+              color:      log.job === "audit" ? "#b39ddb" : "#64b5f6",
+              border:     `1px solid ${log.job === "audit" ? "#4a3270" : "#1e4a6e"}`,
+            }}>
+              {log.job || "system"}
+            </span>
+          </td>
+        )}
+
+        {/* Audit-specific columns */}
+        {tab !== "system" && (
+          <>
+            <td style={{ ...s.td, maxWidth: 90 }}>
+              <CategoryBadge category={log.category} />
+            </td>
+            {tab === "audit" ? (
+              <td style={{ ...s.td, maxWidth: 170 }}>
+                {log.actionType
+                  ? <ActionBadge action={log.actionType} />
+                  : "—"
+                }
+              </td>
+            ) : (
+              <td style={{ ...s.td, maxWidth: 320 }}>
+                <span style={s.msgText}>{log.msg || "—"}</span>
+              </td>
+            )}
+            <td style={{ ...s.td, fontSize: 11.5, color: "var(--orca-muted)" }}>
+              {log.userId ?? "—"}
+            </td>
+            <td style={{ ...s.td, fontSize: 11.5, maxWidth: 130 }}>
+              {log.resourceType
+                ? (
+                  <span style={s.resourceCell}>
+                    <span style={s.resourceType}>{log.resourceType}</span>
+                    {log.resourceId != null && (
+                      <span style={s.resourceId}>#{log.resourceId}</span>
+                    )}
+                  </span>
+                )
+                : "—"
+              }
+            </td>
+            <td style={{ ...s.td, fontSize: 11, fontVariantNumeric: "tabular-nums",
+              color: "var(--orca-muted)", maxWidth: 110, overflow: "hidden",
+              textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {log.ip || "—"}
+            </td>
+          </>
+        )}
+
+        {/* System User ID + message columns */}
+        {tab === "system" && (
+          <>
+            <td style={{ ...s.td, fontSize: 11.5, color: "var(--orca-muted)" }}>
+              {log.userId ?? "—"}
+            </td>
+            <td style={{ ...s.td, maxWidth: 500 }}>
+              <span style={s.msgText}>{log.msg || "—"}</span>
+            </td>
+          </>
+        )}
+
+        {/* Expand toggle */}
+        <td style={{ ...s.td, textAlign: "center" }}>
+          <button
+            style={s.expandBtn}
+            onClick={() => onToggle(idx)}
+            aria-label={expanded ? "Collapse entry" : "Expand entry"}
+            title={expanded ? "Collapse" : "Show full payload"}
+          >
+            {expanded ? "▲" : "▼"}
+          </button>
+        </td>
+      </tr>
+
+      {/* ── Expanded payload ─────────────────────────────────── */}
+      {expanded && (
+        <tr style={{ background: "rgba(255,179,35,0.04)" }}>
+          <td colSpan={colSpan} style={s.payloadTd}>
+            <pre style={s.payload}>
+              {JSON.stringify(log, null, 2)}
+            </pre>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/* ── Sub-components ─────────────────────────────────────────────────── */
+
+/** Colour-coded level pill. */
+function LevelBadge({ level }) {
+  const lv = (level || "info").toLowerCase();
+
+  // `lv` is derived from log.level, which comes from the Loki API and is
+  // therefore untrusted input. Using it as a dynamic object key (colours[lv])
+  // is flagged by security/detect-object-injection because a malicious or
+  // unexpected key could in principle reach into the object's prototype
+  // chain. An explicit switch over known literal values removes the dynamic
+  // property access entirely — there is no expression of the form obj[key]
+  // left for the rule (or an attacker) to worry about.
+  let c;
+  switch (lv) {
+    case "warn":
+      c = { bg: "#2e2400", color: "#f59e0b", border: "#6b4e00" };
+      break;
+    case "error":
+      c = { bg: "#2e0d0d", color: "#f87171", border: "#6b1a1a" };
+      break;
+    case "info":
+    default:
+      c = { bg: "#1a2e3b", color: "#64b5f6", border: "#1e4a6e" };
+      break;
+  }
+
+  return (
+    <span style={{
+      ...s.badge,
+      background: c.bg,
+      color: c.color,
+      border: `1px solid ${c.border}`,
+    }}>
+      {lv}
+    </span>
+  );
+}
+
+/** Colour-coded action type badge.  Destructive actions use a red tint. */
+function ActionBadge({ action }) {
+  const isDestructive = /DELETE|REVOKE|LOCK|TERMINATE/.test(action);
+  const isApproval    = /APPROVE|UNLOCK|VERIFY/.test(action);
+  const bg     = isDestructive ? "#2e0d0d" : isApproval ? "#0d2e1a" : "var(--orca-slate)";
+  const color  = isDestructive ? "#f87171" : isApproval ? "#4ade80" : "var(--orca-ink)";
+  const border = isDestructive ? "#6b1a1a" : isApproval ? "#166534" : "var(--orca-line)";
+  return (
+    <span style={{
+      ...s.actionBadge,
+      background: bg,
+      color,
+      border: `1px solid ${border}`,
+    }}>
+      {action}
+    </span>
+  );
+}
+
+/**
+ * Colour-coded CRUD+Login category badge. Each category gets a fixed,
+ * distinct colour so admins can scan the column visually without reading
+ * every label — e.g. red for Delete jumps out the same way it does for the
+ * destructive ActionBadge styling above, by design.
+ */
+function CategoryBadge({ category }) {
+  const cat = category || "Other";
+
+  let c;
+  switch (cat) {
+    case "Create":
+      c = { bg: "#0d2e1a", color: "#4ade80", border: "#166534" }; // green
+      break;
+    case "Read":
+      c = { bg: "#1a2e3b", color: "#64b5f6", border: "#1e4a6e" }; // blue
+      break;
+    case "Update":
+      c = { bg: "#2e2400", color: "#f59e0b", border: "#6b4e00" }; // amber
+      break;
+    case "Delete":
+      c = { bg: "#2e0d0d", color: "#f87171", border: "#6b1a1a" }; // red
+      break;
+    case "Login":
+      c = { bg: "#2e1d5e", color: "#b39ddb", border: "#4a3270" }; // purple
+      break;
+    case "Other":
+    default:
+      c = { bg: "var(--orca-slate)", color: "var(--orca-muted)", border: "var(--orca-line)" };
+      break;
+  }
+
+  return (
+    <span style={{
+      ...s.badge,
+      background: c.bg,
+      color: c.color,
+      border: `1px solid ${c.border}`,
+    }}>
+      {cat}
+    </span>
+  );
+}
+
+/* ── Styles ─────────────────────────────────────────────────────────── */
+const s = {
+  page: {
+    maxWidth: 1180,
+    margin: "0 auto",
+  },
+
+  /* Header */
+  header: {
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    marginBottom: 24,
+    gap: 16,
+    flexWrap: "wrap",
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: 700,
+    margin: "0 0 4px",
+    color: "var(--orca-ink)",
+  },
+  subtitle: {
+    fontSize: 13,
+    color: "var(--orca-muted)",
+    margin: 0,
+  },
+  headerRight: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    flexShrink: 0,
+  },
+  lastFetched: {
+    fontSize: 11,
+    color: "var(--orca-muted)",
+  },
+  refreshBtn: {
+    fontSize: 13,
+    padding: "7px 14px",
+    borderRadius: 8,
+    border: "1px solid var(--orca-line)",
+    background: "var(--orca-slate)",
+    color: "var(--orca-ink)",
+    cursor: "pointer",
+  },
+
+  /* Tabs */
+  tabBar: {
+    display: "flex",
+    gap: 4,
+    marginBottom: 16,
+    borderBottom: "1px solid var(--orca-line)",
+    paddingBottom: 0,
+  },
+  tab: {
+    fontSize: 13,
+    fontWeight: 500,
+    padding: "8px 16px",
+    border: "none",
+    borderBottom: "2px solid transparent",
+    background: "transparent",
+    color: "var(--orca-muted)",
+    cursor: "pointer",
+    borderRadius: "6px 6px 0 0",
+    transition: "color 0.15s, border-color 0.15s",
+  },
+  tabActive: {
+    color: "var(--orca-hi)",
+    borderBottom: "2px solid var(--orca-hi)",
+    background: "rgba(255,179,35,0.06)",
+  },
+
+  /* Filter bar */
+  filterBar: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 16,
+    flexWrap: "wrap",
+  },
+  searchInput: {
+    flex: "1 1 200px",
+    minWidth: 180,
+    padding: "8px 12px",
+    fontSize: 13,
+    borderRadius: 8,
+    border: "1px solid var(--orca-line)",
+    background: "var(--orca-slate)",
+    color: "var(--orca-ink)",
+    outline: "none",
+  },
+  select: {
+    padding: "8px 10px",
+    fontSize: 13,
+    borderRadius: 8,
+    border: "1px solid var(--orca-line)",
+    background: "var(--orca-slate)",
+    color: "var(--orca-ink)",
+    cursor: "pointer",
+  },
+  resultCount: {
+    fontSize: 12,
+    color: "var(--orca-muted)",
+    whiteSpace: "nowrap",
+    marginLeft: "auto",
+  },
+
+  /* Error */
+  errorBanner: {
+    background: "#2e0d0d",
+    border: "1px solid #6b1a1a",
+    color: "#f87171",
+    borderRadius: 8,
+    padding: "12px 16px",
+    fontSize: 13,
+    marginBottom: 16,
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+  },
+  retryLink: {
+    marginLeft: "auto",
+    background: "transparent",
+    border: "1px solid #6b1a1a",
+    color: "#f87171",
+    fontSize: 12,
+    padding: "4px 10px",
+    borderRadius: 6,
+    cursor: "pointer",
+  },
+
+  /* Table */
+  tableWrapper: {
+    border: "1px solid var(--orca-line)",
+    borderRadius: 10,
+    // Scroll horizontally instead of clipping — the audit/all tabs have 8–9
+    // columns that don't fit a phone, so they'd otherwise be cut off.
+    overflowX: "auto",
+  },
+  table: {
+    width: "100%",
+    // Keep the columns readable and let the wrapper scroll on narrow screens
+    // rather than crushing everything. On desktop the table just fills 100%.
+    minWidth: 760,
+    borderCollapse: "collapse",
+    fontSize: 12.5,
+  },
+  th: {
+    padding: "10px 12px",
+    textAlign: "left",
+    fontSize: 11,
+    fontWeight: 600,
+    color: "var(--orca-muted)",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    background: "var(--orca-abyss)",
+    borderBottom: "1px solid var(--orca-line)",
+    whiteSpace: "nowrap",
+  },
+  tr: {
+    borderBottom: "1px solid rgba(255,255,255,0.04)",
+    transition: "background 0.1s",
+  },
+  td: {
+    padding: "9px 12px",
+    color: "var(--orca-ink)",
+    verticalAlign: "middle",
+  },
+
+  /* Empty / loading */
+  emptyState: {
+    padding: "48px 24px",
+    textAlign: "center",
+    color: "var(--orca-muted)",
+    fontSize: 13,
+  },
+
+  /* Pagination */
+  pagination: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 16,
+    marginTop: 14,
+  },
+  pageBtn: {
+    fontSize: 13,
+    padding: "7px 14px",
+    borderRadius: 8,
+    border: "1px solid var(--orca-line)",
+    background: "var(--orca-slate)",
+    color: "var(--orca-ink)",
+    cursor: "pointer",
+  },
+  pageBtnDisabled: {
+    opacity: 0.4,
+    cursor: "not-allowed",
+  },
+  pageInfo: {
+    fontSize: 12.5,
+    color: "var(--orca-muted)",
+    fontVariantNumeric: "tabular-nums",
+    whiteSpace: "nowrap",
+  },
+
+  /* Badges & pills */
+  badge: {
+    display: "inline-block",
+    fontSize: 10,
+    fontWeight: 700,
+    padding: "2px 7px",
+    borderRadius: 4,
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+    whiteSpace: "nowrap",
+  },
+  jobPill: {
+    display: "inline-block",
+    fontSize: 10,
+    fontWeight: 600,
+    padding: "2px 7px",
+    borderRadius: 4,
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+  },
+  actionBadge: {
+    display: "inline-block",
+    fontSize: 10.5,
+    fontWeight: 600,
+    padding: "3px 8px",
+    borderRadius: 5,
+    letterSpacing: "0.02em",
+    whiteSpace: "nowrap",
+    maxWidth: 200,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+
+  /* Resource cell */
+  resourceCell: {
+    display: "flex",
+    alignItems: "center",
+    gap: 4,
+  },
+  resourceType: {
+    fontSize: 11,
+    color: "var(--orca-muted)",
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+  },
+  resourceId: {
+    fontSize: 11,
+    color: "var(--orca-hi)",
+    fontVariantNumeric: "tabular-nums",
+  },
+
+  /* Message text */
+  msgText: {
+    display: "block",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    maxWidth: 460,
+    color: "var(--orca-ink)",
+  },
+
+  /* Expand */
+  expandBtn: {
+    background: "transparent",
+    border: "none",
+    color: "var(--orca-muted)",
+    cursor: "pointer",
+    fontSize: 10,
+    padding: "4px 6px",
+    borderRadius: 4,
+    lineHeight: 1,
+  },
+
+  /* Payload JSON viewer */
+  payloadTd: {
+    padding: "0 12px 12px 12px",
+    borderBottom: "1px solid var(--orca-line)",
+  },
+  payload: {
+    margin: 0,
+    padding: "12px 14px",
+    background: "var(--orca-abyss)",
+    borderRadius: 8,
+    border: "1px solid var(--orca-line)",
+    fontSize: 11.5,
+    color: "#94a3b8",
+    overflowX: "auto",
+    lineHeight: 1.6,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-all",
+  },
+};

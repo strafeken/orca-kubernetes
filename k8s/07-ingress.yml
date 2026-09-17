@@ -1,0 +1,76 @@
+# Ported from nginx/nginx.dev.conf's add_header lines. This is a Traefik CRD,
+# not a plain annotation, since header injection needs the dynamic
+# configuration Traefik's Ingress-provider annotations don't cover.
+#
+# CRD group check: RKE2 v1.36 bundles a Traefik version whose CRDs use group
+# traefik.io/v1alpha1. If `kubectl apply` on this file errors with "no
+# matches for kind Middleware", run `kubectl get crd | grep traefik` and
+# swap the apiVersion below to whatever group is actually installed
+# (older Traefik versions use traefik.containo.us/v1alpha1).
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: orca-security-headers
+  namespace: orca
+spec:
+  headers:
+    frameDeny: true                     # X-Frame-Options: DENY
+    contentTypeNosniff: true            # X-Content-Type-Options: nosniff
+    referrerPolicy: "strict-origin-when-cross-origin"
+    customResponseHeaders:
+      Permissions-Policy: "geolocation=(), microphone=(self), camera=(self)"
+      # CSP connect-src hardcodes the hostname. Update BOTH this and
+      # APP_URL in 02-configmap-env.yaml together when you point this at a
+      # different host (ORCA_HOSTNAME locally, your real domain on EC2) or the
+      # browser will silently block API/WebSocket calls with a CSP violation
+      # that just looks like "nothing works" in the network tab.
+      Content-Security-Policy: >-
+        default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob:; media-src 'self' blob:;
+        connect-src 'self' wss://ORCA_HOSTNAME https://ORCA_HOSTNAME https://*.metered.ca wss://*.metered.ca;
+        font-src 'self'; worker-src 'self' blob:; object-src 'none'; frame-ancestors 'none';
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orca
+  namespace: orca
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: "orca-orca-security-headers@kubernetescrd"
+    # Forces http->https at the router level, since compose's nginx did the
+    # same with its 301 redirect server block.
+    traefik.ingress.kubernetes.io/router.entrypoints: "websecure"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - ORCA_HOSTNAME
+      secretName: orca-tls
+  rules:
+    - host: ORCA_HOSTNAME
+      http:
+        paths:
+          # Order matters: more specific paths first. Traefik/Kubernetes
+          # Ingress matches on longest-prefix, but keeping the specific
+          # rules above the catch-all avoids relying on that behavior.
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 3000
+          - path: /socket.io
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 3000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
