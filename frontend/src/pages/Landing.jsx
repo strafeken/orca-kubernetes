@@ -30,7 +30,7 @@ export default function Landing() {
           On-site expert consultation
         </p>
         <h1 style={s.h1}>
-          Bring the expert
+          Bring the TEST
           <br />
           to the problem.
         </h1>
