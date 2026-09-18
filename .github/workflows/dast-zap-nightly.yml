@@ -1,0 +1,26 @@
+name: DAST - ZAP Full Scan (Nightly)
+
+on:
+  schedule:
+    - cron: '0 18 * * *'   # 18:00 UTC = 2am SGT
+  workflow_dispatch:
+
+jobs:
+  zap-full-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.13.0
+        with:
+          target: 'https://orca-staging.xubi.org'
+          rules_file_name: 'zap-rules.tsv'
+          cmd_options: '-z "-config network.connection.sslErrorTolerant=true"'
+          allow_issue_writing: false
+          fail_action: false
+      - name: Upload ZAP full report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: zap-full-nightly-report
+          path: report_html.html
