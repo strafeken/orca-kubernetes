@@ -45,6 +45,7 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            export PATH=$PATH:/var/lib/rancher/rke2/bin
             cd ~/orca-kubernetes
             git pull
             cd k8s
@@ -64,6 +65,7 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            export PATH=$PATH:/var/lib/rancher/rke2/bin
             cd ~/orca-kubernetes
             git pull
             cd k8s
