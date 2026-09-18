@@ -10,7 +10,7 @@ fi
 
 rm -rf rendered
 mkdir rendered
-for f in *.yaml; do
+for f in *.yml; do
   sed -e "s/ORCA_HOSTNAME/$HOSTNAME/g" -e "s/ORCA_IMAGE_TAG/$IMAGE_TAG/g" "$f" > "rendered/$f"
 done
 
