@@ -30,9 +30,9 @@ export default function Landing() {
           On-site expert consultation
         </p>
         <h1 style={s.h1}>
-          Bring the TEST
+          Bring the expert
           <br />
-          to the problem.
+          to the TESTING.
         </h1>
         <p style={s.lede}>
           ORCA connects a worker standing in front of a problem with the right verified
