@@ -49,7 +49,7 @@ jobs:
             cd ~/orca-kubernetes
             git pull
             cd k8s
-            ./deploy.sh staging.orca.freeddns.org ${{ needs.build.outputs.image_tag }}
+            ./deploy.sh orca-staging.xubi.org ${{ needs.build.outputs.image_tag }}
             sleep 15
             kubectl get pods -n orca
 
