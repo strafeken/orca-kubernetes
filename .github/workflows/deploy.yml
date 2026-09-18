@@ -70,7 +70,7 @@ jobs:
           path: report_html.html
 
   deploy-production:
-    needs: [build, deploy-staging, zap-scan]
+    needs: [build, deploy-staging, zap-baseline]
     runs-on: ubuntu-latest
     environment: production
     steps:
