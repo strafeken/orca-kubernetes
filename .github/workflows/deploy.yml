@@ -69,8 +69,24 @@ jobs:
           name: zap-baseline-report
           path: report_html.html
 
+  nuclei-scan:
+    needs: zap-baseline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Nuclei Scan
+        uses: projectdiscovery/nuclei-action@v3.1.1
+        with:
+          target: 'https://orca-staging.xubi.org'
+          flags: '-severity critical,high -stats'
+      - name: Upload Nuclei report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: nuclei-report
+          path: nuclei-output.txt
+
   deploy-production:
-    needs: [build, deploy-staging, zap-baseline]
+    needs: [build, deploy-staging, zap-baseline, nuclei-scan]
     runs-on: ubuntu-latest
     environment: production
     steps:
