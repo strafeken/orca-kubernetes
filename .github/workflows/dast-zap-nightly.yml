@@ -2,7 +2,7 @@ name: DAST - ZAP Full Scan (Nightly)
 
 on:
   schedule:
-    - cron: '0 18 * * *'   # 18:00 UTC = 2am SGT
+    - cron: '0 18 * * *'   # Targets ~2am SGT, but GitHub Actions cron runs on a best-effort basis and can fire later
   workflow_dispatch:
 
 jobs:
