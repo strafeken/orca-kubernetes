@@ -76,8 +76,7 @@ jobs:
       - name: Run Nuclei Scan
         uses: projectdiscovery/nuclei-action@v3.1.1
         with:
-          target: 'https://orca-staging.xubi.org'
-          flags: '-severity critical,high -stats'
+          args: '-u https://orca-staging.xubi.org -severity critical,high -stats -o nuclei-output.txt'
       - name: Upload Nuclei report
         uses: actions/upload-artifact@v7
         if: always()
