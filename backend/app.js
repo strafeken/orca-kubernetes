@@ -33,14 +33,13 @@ const { generateCsrfToken, doubleCsrfProtection } = doubleCsrf({
 app.use(cookieParser());
 app.use(express.json());
 app.use(httpLogger);
+app.use('/api/health', require('./routes/health'));
 app.use(globalLimiter);
 
 app.get('/api/csrf-token', (req, res) => {
   const csrfToken = generateCsrfToken(req, res);
   res.json({ csrfToken });
 });
-
-app.use('/api/health', require('./routes/health'));
 
 app.use(doubleCsrfProtection);
 
